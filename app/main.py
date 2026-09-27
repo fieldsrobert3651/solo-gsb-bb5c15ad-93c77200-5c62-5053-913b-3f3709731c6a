@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import run_audit
+from .avoid_vulnerabilities import run_avoid_vulnerabilities
 from .chokepoint_audit import run_dependency_chokepoints
 from .diagnose import run_root_conflict_diagnosis
 from .environment_matrix import parse_environments, run_environment_matrix
@@ -129,6 +130,18 @@ class AdvisoryInput(BaseModel):
     package: str = Field(..., description="Affected package name.")
     affected: str = Field(
         ..., description="PEP 440 specifier of the affected version range."
+    )
+
+
+class AvoidVulnerabilitiesRequest(ResolveRequest):
+    advisories: list[AdvisoryInput] = Field(
+        ...,
+        description=(
+            "Local advisories to avoid. Every index version of an advisory's "
+            "canonical package inside its PEP 440 'affected' range is excluded "
+            "from this request's index before solving; multiple advisories "
+            "union."
+        ),
     )
 
 
@@ -253,7 +266,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -356,6 +369,40 @@ def run_resolution_job(
 @app.post("/resolve")
 async def resolve_endpoint(payload: ResolveRequest) -> JSONResponse:
     body, status_code, _error, _attempts = _resolve_body(payload)
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@app.post("/resolve/avoid-vulnerabilities")
+async def avoid_vulnerabilities_endpoint(
+    payload: AvoidVulnerabilitiesRequest,
+) -> JSONResponse:
+    """Resolve while never selecting an advisory-affected version.
+
+    Accepts the exact same body as ``/resolve`` plus ``advisories`` (a list
+    of local ``id`` / ``package`` / ``affected`` entries).  Before solving,
+    every index version of each advisory's canonical package that falls
+    inside its PEP 440 ``affected`` range is removed from a request-local
+    copy of the index; exclusions from multiple advisories take the union.
+    The remaining candidates are solved with the ordinary exhaustive
+    backtracking, so a locked version an advisory excludes is never selected
+    again (reported as ``missing-version``).
+
+    On success the body carries a safe ``resolved`` / ``dependency_graph`` /
+    ``locks`` plus the versions each advisory actually excluded and their
+    union.  No solution returns 409 ``conflict``; hitting ``max_attempts``
+    returns 409 ``undetermined`` and is never treated as unsatisfiable.
+    Malformed advisories (e.g. invalid PEP 440 ranges) return 400.
+    """
+    index, entries, locks = _parse_input(payload)
+    body, status_code = run_avoid_vulnerabilities(
+        index,
+        entries,
+        locks,
+        payload.advisories,
+        allow_prereleases=payload.allow_prereleases,
+        marker_env=payload.marker_env,
+        max_attempts=payload.max_attempts,
+    )
     return JSONResponse(status_code=status_code, content=body)
 
 
