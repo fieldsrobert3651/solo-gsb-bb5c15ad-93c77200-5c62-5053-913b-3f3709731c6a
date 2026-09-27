@@ -70,6 +70,14 @@
   （不沿旧依赖图推断），两次都成功时列出新增、消失与版本改变的包，并返回撤回后的
   依赖图与锁处置；基线冲突、撤回后冲突与任一次搜索触顶分别给出明确状态，触顶不
   视为无解。
+- **漏洞规避解析**：`POST /resolve/avoid-vulnerabilities` 沿用 `/resolve` 的包清单、
+  根需求、锁与解析选项，外加一份本地公告列表（`id`、`package`、`affected` PEP 440
+  范围）。先按规范包名与 PEP 440 范围把**本次清单**中命中公告的版本全部移除
+  （多条公告的排除结果取**并集**），再在剩余候选上做**完整回溯**求解——已排除的
+  锁定版本不会被选回（按 `missing-version` 报告）。成功时返回安全的 `resolved`、
+  `dependency_graph`、`locks` 以及各公告**实际排除的版本**；无剩余解返回 409
+  冲突，`max_attempts` 触顶返回 `undetermined`（同样 409，不视为无解），非法公告
+  返回 400。
 
 ## 一条命令启动
 
@@ -83,6 +91,7 @@ docker compose up --build
 
 - `GET /health` — 健康检查
 - `POST /resolve` — 同步解析依赖（保持原有行为不变）
+- `POST /resolve/avoid-vulnerabilities` — 排除本地公告命中的版本后完整回溯，求一份安全的解
 - `POST /diagnose/root-conflict` — 诊断最小冲突根需求集合（与 `/resolve` 同请求体）
 - `POST /audit/vulnerabilities` — 用本地公告列表审计已解析的依赖图
 - `POST /audit/licenses` — 用本地许可证策略审计已解析的包
@@ -832,6 +841,91 @@ curl -s -X POST localhost:8000/analyze/version-withdrawal \
 版本为空返回 `422`，包或版本在清单中不存在（或版本不是合法 PEP 440）返回
 `400`。
 
+## 漏洞规避解析 API
+
+`POST /resolve/avoid-vulnerabilities` 接收与 `/resolve` **完全相同的请求字段**
+（`packages`、`root`、`locks`、`allow_prereleases`、`marker_env`、`max_attempts`，
+校验规则完全一致），外加一份本地公告列表 `advisories`，每条公告含 `id`、`package`
+与 `affected`（受影响版本的 PEP 440 说明符，如 `>=1.0,<2.0`；空字符串表示全部
+版本）。服务先把命中公告的版本从**本次请求的清单副本**中移除，再在剩余候选上
+求解：
+
+- 包名按清单自身规则规范化（`Foo_Bar` 与 `foo-bar` 视为同一包）；每条公告命中的
+  版本为该包在清单中、落在 `affected` 范围内的版本（预发布版本同样参与命中判定，
+  与 `allow_prereleases` 无关）。
+- **多条公告的排除结果取并集**：被任一公告排除的版本不会因另一条公告未提及而
+  回来；同一版本被多条公告命中时只移除一次，但会分别计入每条公告的排除清单。
+- 排除只影响**本次请求**：求解在清单副本上进行，后续请求仍看得到原始版本。某包的
+  版本被全部排除时，该包仍留在清单中（版本列表为空），求解器报告“无可用版本”
+  而非“包不存在”。
+- 随后是对**完整依赖约束的整体重算**——由求解器在剩余候选上从头完整回溯，而不是
+  沿旧依赖图推断——因此排除引发的回退版本、新引入或被丢弃的传递依赖都会被重新
+  计算。
+- **已排除的锁定版本不得选回**：锁针对排除后的清单求值，被排除的钉版已不在候选
+  中，按 `missing-version` 报告；未受影响的锁仍按 `/resolve` 的锁定优先规则保留。
+
+```bash
+curl -s -X POST localhost:8000/resolve/avoid-vulnerabilities \
+  -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "app": {"1.0": {"dependencies": {"web": ""}}},
+    "web": {"3.0": {"dependencies": {"common": ">=2.0"}},
+            "2.0": {"dependencies": {"common": "<2.0", "extra": ""}}},
+    "common": {"1.5": {}, "2.0": {}},
+    "extra": {"1.0": {}}
+  },
+  "root": {"app": ""},
+  "advisories": [
+    {"id": "CVE-2026-0001", "package": "web", "affected": ">=3.0"}
+  ]
+}'
+```
+
+成功响应（HTTP 200，`status: "ok"`）：
+
+```json
+{
+  "status": "ok",
+  "attempts": 3,
+  "allow_prereleases": false,
+  "resolved": {"app": "1.0", "common": "1.5", "extra": "1.0", "web": "2.0"},
+  "dependency_graph": [ ... ],
+  "locks": {},
+  "exclusions": [
+    {
+      "advisory": {"id": "CVE-2026-0001", "package": "web", "affected": ">=3.0"},
+      "package": "web",
+      "excluded_versions": ["3.0"]
+    }
+  ]
+}
+```
+
+响应字段：
+
+- `resolved` / `dependency_graph` / `locks`：排除后求得的**安全**解、依赖图与每个
+  锁的处置，形态与 `/resolve` 成功响应完全一致。
+- `exclusions`：**每条公告一项**（按公告输入顺序），含公告原文（`id`、规范化
+  `package`、`affected` 原文）、规范化 `package` 以及 `excluded_versions`——该公告
+  在本次清单中**实际排除**的版本（按版本从高到低）。公告的包不在清单中时该列表
+  为空（不视为非法输入）。
+- `attempts`：在剩余候选上实际求值的候选次数。
+
+其他响应形态：
+
+- **无解**：HTTP **409**，`status: "conflict"`，带结构化 `conflict`（与
+  `/resolve` 冲突响应同形态）、`locks` 与同样的 `exclusions` 报告；没有解时不带
+  `resolved` / `dependency_graph`。
+- **未确定**：在剩余候选上的搜索触及 `max_attempts` 时返回 HTTP **409**、
+  `status: "undetermined"` 与 `error.code = "search_limit_exceeded"`；搜索触顶
+  **不视为无解**，因此不返回 `resolved`，但仍带 `conflict` 与 `exclusions`。
+- **非法公告**：任一公告的 `affected` 不是合法 PEP 440 说明符时返回 **400**
+  （`invalid_request`，错误信息带公告 `id`）；公告缺字段、字段类型错误或含多余
+  字段返回 `422`。`packages` / `root` / `locks` 的校验与 `/resolve` 完全一致。
+- `advisories` 可省略或为空列表，此时行为与 `/resolve` 完全相同。
+
+结果顺序稳定：相同输入永远得到相同的解、依赖图、`exclusions` 与 `attempts`。
+
 ## 数据持久化
 
 异步作业保存在 SQLite（WAL 模式），数据库路径由环境变量 `RESOLVER_DB` 控制，
@@ -849,7 +943,8 @@ curl -s -X POST localhost:8000/analyze/version-withdrawal \
 （`/analyze/environment-matrix` 在此基础上把顶层 `marker_env` 换成 2～8 个各自
 携带 `marker_env` 的 `environments`，其余字段一致；`/analyze/version-withdrawal`
 则在与 `/resolve` 完全相同的字段之外增加一个 `withdraw: {"package", "version"}`
-目标）：
+目标；`/resolve/avoid-vulnerabilities` 在与 `/resolve` 完全相同的字段之外增加一个
+`advisories: [{"id", "package", "affected"}]` 列表）：
 
 ```json
 {
@@ -998,14 +1093,15 @@ app/
   diagnose.py       # 根需求冲突诊断：逐条暂删+复算的最小冲突根集合（搜索触顶返回未确定）
   environment_matrix.py # 环境矩阵：多标记环境独立求解、成功环境版本矩阵与差异汇总
   version_withdrawal.py # 版本撤回分析：基线求解、移除单版本后整体重算、新增/消失/变更对比
+  avoid_vulnerabilities.py # 漏洞规避解析：按公告并集排除命中版本、剩余候选完整回溯、各公告实际排除版本
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   chokepoint_audit.py # 关键节点审计：可达性、支配者不动点、支配树与独占支配汇总
   graph_fingerprints.py # 闭包指纹：可达闭包的确定性序列化与 SHA-256、不可达包单列
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py           # FastAPI 应用与 /resolve、/diagnose/root-conflict、/audit/*、/plan/rebuild、/analyze/environment-matrix、/analyze/version-withdrawal、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计、闭包指纹、重建计划、环境矩阵与版本撤回分析）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+  main.py           # FastAPI 应用与 /resolve、/resolve/avoid-vulnerabilities、/diagnose/root-conflict、/audit/*、/plan/rebuild、/analyze/environment-matrix、/analyze/version-withdrawal、/jobs、/health
+tests/              # 端到端 API 测试（含漏洞规避解析、漏洞、关键节点、许可证审计、闭包指纹、重建计划、环境矩阵与版本撤回分析）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml
